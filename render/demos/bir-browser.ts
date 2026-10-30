@@ -26,7 +26,10 @@ import { attachWidgetControls } from "./widget-control.ts";
 import type { Box, HandleMeta } from "./roi-widget.ts";
 import { createMosaic } from "./mosaic.ts";
 import { installChrome, type VizControl } from "./sl-chrome.ts";
-import { loadSegmentation, loadSeries, loadThumbnail } from "../vendor/idc_tools/index.js";
+import { loadSegmentation, loadSegmentationFromBuffer, loadSeries, loadThumbnail } from "../vendor/idc_tools/index.js";
+import { chooseSeg, fetchSegInstance, type GcpSeg, gcpParamValue, segAction, stripSegs } from "./gcp-source.ts";
+import { AuthError, gcpFetch, takeUrlToken } from "./gcp-auth.ts";
+import { connectGcp, type GcpState, noticeForState, openDataSources, readGcpParam, storeNotice } from "./gcp-panel.ts";
 import type { CTVolume, GeomCheck, SegLabelmap, SeriesGeometry } from "../vendor/idc_tools/types.js";
 import { type BirApi, mountBir, type Plane, type StripItem } from "./bir.ts";
 import { downloadStudyWithDialog, type SeriesRef, shareStudy } from "./idc-share.ts";
@@ -41,6 +44,9 @@ import type { Vec3 } from "../mat4.ts";
 //   IHE IID form:            ?requestType=STUDY&studyUID=<uid>[&seriesUID=<uid>]
 //   Fast direct-S3 form:     ?series=<crdc_uuid>&bucket=<b>[&seg=<uuid>&segBucket=<b>]
 //   (no params → the default KiTS-00051 CT+SEG demo)
+// Either UID form can add a secondary store of segmentations, as IDC's OHIF and Slim do:
+//   &gcp=projects/<p>/locations/<l>/datasets/<d>/dicomStores/<s>   (Google Cloud Healthcare;
+//   sign-in via gcp-auth.ts, `&token=` for testing; its SEGs join the study by UID)
 const P = new URLSearchParams(location.search);
 
 interface Source {
@@ -59,7 +65,12 @@ interface Source {
    *  presence is what enables the streaming load: allocate and position the volume now, fill
    *  it as slices arrive. Absent → the assemble-then-show path. */
   geom?: SeriesGeometry;
+  /** A SEG from the `?gcp=` store to show instead of an IDC one (`s` is then unset). */
+  gseg?: GcpSeg;
 }
+
+/** What the `?gcp=` store contributed to this page load (resolveSource fills it in). */
+let gcp: GcpState = { raw: null, store: null, segs: [] };
 
 const KITS_DEFAULT: Source = {
   c: "e3e86cde-da96-44b0-9e3b-b0b7bdd5a675",
@@ -258,18 +269,45 @@ async function resolveSource(onStatus: (m: string) => void): Promise<Source> {
       geom: await geometryForUuid(series),
     };
   }
+  takeUrlToken(); // off the address bar before anything else can see it
+  gcp = readGcpParam(P.get("gcp"));
   const studyUIDs = [...splitList(P.get("StudyInstanceUIDs")), ...splitList(P.get("studyUID"))];
+  if (!studyUIDs.length && gcp.store?.study) studyUIDs.push(gcp.store.study); // OHIF's suffix form
   if (studyUIDs.length) {
     const want = [
       ...splitList(P.get("SeriesInstanceUIDs")),
       ...splitList(P.get("initialSeriesInstanceUID")),
       ...splitList(P.get("seriesUID")),
     ];
+    if (!want.length && gcp.store?.series) want.push(gcp.store.series);
+    if (gcp.store) {
+      // The store's SEGs decide which image opens, so they are listed BEFORE the IDC resolve.
+      // The study rows load meanwhile; the gate, if it shows, waits on a person anyway.
+      const rows = readStudyRows(studyUIDs[0], onStatus);
+      rows.catch(() => {}); // rethrown by the await below
+      gcp = await connectGcp(gcp, studyUIDs[0], onStatus);
+      const inStudy = await rows;
+      const pick = chooseSeg(gcp.segs, want, {
+        images: new Set(inStudy.filter((r) => IMG.has(String(r.Modality).toUpperCase())).map((r) => String(r.SeriesInstanceUID))),
+        segs: new Set(inStudy.filter((r) => String(r.Modality).toUpperCase() === "SEG").map((r) => String(r.SeriesInstanceUID))),
+      });
+      if (pick) {
+        // The store's SEG replaces IDC's default one. Spread, not stored: the memo keeps the
+        // plain IDC answer, which is still right for a load without the store.
+        const src = await resolveFromIndex(studyUIDs[0], pick.image ? [pick.image] : [], onStatus);
+        return { ...src, s: undefined, sb: undefined, sgid: pick.seg.seriesUID, gseg: pick.seg };
+      }
+    }
     return await resolveFromIndex(studyUIDs[0], want, onStatus);
   }
   onStatus("looking the demo case up in the IDC index…");
   return { ...KITS_DEFAULT, geom: await geometryForUuid(KITS_DEFAULT.c) };
 }
+
+// The modalities resolveFromIndex will open as the volume (and a store's SEG may be drawn on).
+// US included: ReMIND 3D ultrasound is a single enhanced/multi-frame instance, which the
+// idc_tools worker now reconstructs into a volume like any other series.
+const IMG = new Set(["CT", "MR", "PT", "PET", "NM", "US"]);
 
 /** Resolve a StudyInstanceUID (+ optional SeriesInstanceUIDs) to an S3 image series (+ SEG)
  *  via the SLIM idc-index — the OHIF/IDC-portal drop-in path. Reads only the 1–2 sorted row
@@ -301,9 +339,6 @@ async function resolveFromIndex(
 
   const inStudy = await readStudyRows(studyUID, onStatus);
   const want = new Set(wantSeries);
-  // US included: ReMIND 3D ultrasound is a single enhanced/multi-frame instance, which the
-  // idc_tools worker now reconstructs into a volume like any other series.
-  const IMG = new Set(["CT", "MR", "PT", "PET", "NM", "US"]);
   const imgs = inStudy.filter((r) => IMG.has(String(r.Modality).toUpperCase()));
   const segs = inStudy.filter((r) => String(r.Modality).toUpperCase() === "SEG");
   // Prefer an explicitly-requested image series. Failing that, the largest series that the index
@@ -491,6 +526,13 @@ async function main() {
   };
   status("contacting the NCI Imaging Data Commons…");
   const source = await resolveSource(setLoad);
+  // A store SEG downloads alongside the images: it needs only its UIDs, and it goes on as soon
+  // as there is a grid to decode it onto. Progress is wired up once the reader can show it.
+  let gsegSay: ((p: { msg: string; frac?: number }) => void) | null = null;
+  const gsegBytes = source.gseg && gcp.store
+    ? fetchSegInstance(gcp.store, source.st, source.gseg, gcpFetch, (p) => gsegSay?.(p))
+    : null;
+  gsegBytes?.catch(() => {}); // reported by showSegmentation, which awaits it
 
   // ---- the volume, before its data ---------------------------------------------------------
   // The index gives the geometry — origin, orientation, spacing, extent — so the volume can be
@@ -502,6 +544,8 @@ async function main() {
   // decode also carries the greys and the window the placeholder is built from, so the stand-in
   // matches this study rather than a modality default.
   const streaming = !!source.geom;
+  /** Slices are still arriving: the status line is the volume's, not a segmentation's. */
+  let volumeLoading = streaming;
   // Streaming: the views are usable from the first frame, so the progress display is PACKED at
   // the bottom of the layout rather than covering them. Without geometry there is nothing to
   // look at until the end, so it stays an overlay.
@@ -851,21 +895,42 @@ async function main() {
    *  megabytes — to redraw an overlay that is one object. The images are already decoded and the
    *  scene already exists, so the SEG decodes against the volume's own grid and attaches to it;
    *  nothing else moves. The URL is updated in place so the link still describes what is shown.
+   *
+   *  `from` is an IDC SEG (S3 prefix + bucket) or a `?gcp=` store SEG, whose bytes come over
+   *  DICOMweb with the sign-in token and are handed to the decoder as one buffer.
    */
   let segSwapping = false;
-  const showSegmentation = async (segUuid: string, bucket: string, seriesUID: string, label: string) => {
+  const showSegmentation = async (
+    seriesUID: string,
+    label: string,
+    from: { s: string; sb: string } | { gseg: GcpSeg; bytes?: Promise<ArrayBuffer> | null },
+  ) => {
     if (segSwapping) return;
     segSwapping = true;
+    // While the volume streams in, its progress owns the status line; the overlay appearing is
+    // the news.
+    const say = (m: string) => { if (!volumeLoading) status(m); };
+    const onProgress = (p: { msg: string; frac?: number }) =>
+      say(`${label}: ${p.msg}${p.frac ? ` — ${Math.round(p.frac * 100)}%` : ""}`);
+    const grid = { dims: sc.dims, ijkToRAS: sc.ijkToRAS };
     try {
-      status(`loading ${label}…`);
-      const sg = await loadSegmentation(segUuid, bucket, { dims: sc.dims, ijkToRAS: sc.ijkToRAS }, {
-        onProgress: (p: { msg: string; frac?: number }) =>
-          status(`${label}: ${p.msg}${p.frac ? ` — ${Math.round(p.frac * 100)}%` : ""}`),
-      });
-      if (!sg) throw new Error("no DICOM under that segmentation series");
+      say(`loading ${label}…`);
+      let sg: SegLabelmap | null;
+      if ("gseg" in from) {
+        gsegSay = onProgress;
+        const buf = await (from.bytes ?? fetchSegInstance(gcp.store!, source.st, from.gseg, gcpFetch, onProgress));
+        sg = await loadSegmentationFromBuffer(buf, grid, { onProgress });
+        if (!sg) throw new Error("the segmentation decoded to nothing");
+        source.gseg = from.gseg;
+        source.s = source.sb = undefined;
+      } else {
+        sg = await loadSegmentation(from.s, from.sb, grid, { onProgress });
+        if (!sg) throw new Error("no DICOM under that segmentation series");
+        source.s = from.s;
+        source.sb = from.sb;
+        source.gseg = undefined;
+      }
       shownSeg = sg;
-      source.s = segUuid;
-      source.sb = bucket;
       source.sgid = seriesUID;
       sc.attachSegmentation(sg);
       segAttached = true;
@@ -878,11 +943,29 @@ async function main() {
       const u = new URL(location.href);
       if (source.st) u.searchParams.set("StudyInstanceUIDs", source.st);
       u.searchParams.set("SeriesInstanceUIDs", [source.sid, seriesUID].filter(Boolean).join(","));
+      // These would otherwise still name the segmentation the page OPENED with.
+      u.searchParams.delete("initialSeriesInstanceUID");
+      u.searchParams.delete("seriesUID");
       history.replaceState(null, "", u.toString());
-      status(READY);
+      if (!volumeLoading) status(READY);
+      if ("gseg" in from && from.gseg.instances > 1) {
+        storeNotice(`${label} has ${from.gseg.instances} instances; only the first is shown.`, true);
+      }
     } catch (e) {
-      status(`Couldn't load ${label}: ${(e as Error).message}`, true);
-      setTimeout(() => status(READY), 6000);
+      const msg = (e as Error).message;
+      if ("gseg" in from) {
+        // A banner rather than the status line: a store error (access, sign-in, a SEG the
+        // decoder can't read) is something to act on, and it shouldn't scroll away in 6 s.
+        storeNotice(
+          `Couldn't load ${label} from the Google Cloud store: ${msg}`,
+          true,
+          e instanceof AuthError ? { label: "Sign in", run: () => openDataSources(gcp) } : undefined,
+        );
+        if (!volumeLoading) status(READY);
+      } else {
+        status(`Couldn't load ${label}: ${msg}`, true);
+        setTimeout(() => { if (!volumeLoading) status(READY); }, 6000);
+      }
     } finally {
       segSwapping = false;
     }
@@ -895,6 +978,8 @@ async function main() {
     for (const k of ["series", "seg", "bucket", "segBucket", "modality", "initialSeriesInstanceUID", "seriesUID"]) u.searchParams.delete(k);
     location.href = u.toString();
   };
+  /** The source as Share and Download see it: with the `?gcp=` store, when one is in use. */
+  const withStore = () => ({ ...source, gcp: gcp.store ? gcpParamValue(gcp.store) : undefined });
 
   // Build the strip from the study's every series (image stacks + SEG + SR/PR/…), OHIF-ordered
   // by SeriesNumber. Free when we arrived by StudyInstanceUID (readStudyRows is memoized); the
@@ -940,11 +1025,39 @@ async function main() {
           // swapping it in place is the difference between one object and the whole series.
           open: () =>
             mod === "SEG" && r.crdc_series_uuid
-              ? showSegmentation(String(r.crdc_series_uuid), String(r.aws_bucket),
-                String(r.SeriesInstanceUID), desc || "segmentation")
+              ? showSegmentation(String(r.SeriesInstanceUID), desc || "segmentation",
+                { s: String(r.crdc_series_uuid), sb: String(r.aws_bucket) })
               : navigateToSeries(String(r.SeriesInstanceUID)),
         };
       });
+      // The `?gcp=` store's segmentations lead the strip: they are what this page was opened to
+      // review. Text rows, like IDC's SEGs, tagged so it's clear where each one lives.
+      if (gcp.store) {
+        const store = gcp.store;
+        const imgs = new Set(rows.filter((r) => IMG.has(String(r.Modality).toUpperCase())).map((r) => String(r.SeriesInstanceUID)));
+        const gcpRows: StripItem[] = stripSegs(gcp.segs, new Set(rows.map((r) => String(r.SeriesInstanceUID)))).map((g) => {
+          const act = segAction(g, source.sid, imgs);
+          const label = g.description || "segmentation";
+          return {
+            seriesUID: g.seriesUID,
+            modality: "SEG",
+            overlay: true,
+            tag: "GCP",
+            hint: `Google Cloud: ${store.path}` + (act.kind === "none" ? `\n${act.why}` : ""),
+            lines: [...(g.description ? [g.description] : []), `${g.instances} inst`],
+            current: false,
+            disabled: act.kind === "none",
+            thumb: (): Promise<Blob | null> => Promise.resolve(null),
+            open: () =>
+              act.kind === "swap"
+                ? showSegmentation(g.seriesUID, label, { gseg: g })
+                : act.kind === "navigate"
+                ? navigateToSeries(`${act.image},${g.seriesUID}`)
+                : undefined,
+          };
+        });
+        seriesStrip = [...gcpRows, ...seriesStrip];
+      }
     } catch { /* no study rows → no strip (e.g. direct ?series= with no study) */ }
   }
 
@@ -989,13 +1102,19 @@ async function main() {
         id: "idc-share",
         icon: "share",
         title: "Share — copy a link that reopens this study here (or in the IDC OHIF portal)",
-        run: () => shareStudy(source),
+        run: () => shareStudy(withStore()),
       },
       {
         id: "idc-download",
         icon: "download",
         title: "Download this study's DICOM to a local folder (streamed, parallel)",
-        run: () => downloadStudyWithDialog(source, listAllStudySeries),
+        run: () => downloadStudyWithDialog(withStore(), listAllStudySeries),
+      },
+      {
+        id: "gcp-sources",
+        icon: "cloud",
+        title: "Data sources — add segmentations from a Google Cloud DICOM store",
+        run: () => openDataSources(gcp),
       },
     ],
   });
@@ -1335,7 +1454,7 @@ async function main() {
       // region belongs to two segments rather than inferring one odd-coloured one.
       note: () => {
         if (stack) {
-          return res.seg || source.s
+          return res.seg || source.s || source.gseg
             ? "⚠ Segmentation hidden — this series is a stack of images, not a volume, so a " +
               "segmentation drawn on the slice positions cannot be registered to it."
             : null;
@@ -1359,12 +1478,12 @@ async function main() {
   applyAnn();
   applySegOverlay();   // outline-by-default: the scene is built with the fill showing
   // Which segmentation is on screen, if the study opened with one.
-  if (source.s) {
+  if (source.s || source.gseg) {
     if (source.sgid) bir.markOverlay(source.sgid);
   }
   // What the headers said about the geometry, before anyone reads the images.
   if (geomCheck && (geomCheck.stack || geomCheck.notes.length)) {
-    geometryNotice(geomCheck, !!(res.seg || source.s));
+    geometryNotice(geomCheck, !!(res.seg || source.s || source.gseg));
   }
   const info = document.getElementById("info");
   if (info) info.textContent = `${source.sd} · ${res.ct.modality} ${sc.dims.join("×")} · ${source.lic}`;
@@ -1374,9 +1493,17 @@ async function main() {
   const READY = stack
     ? `${source.sd} — image stack: scroll to page images, pick a tool from the toolbar`
     : `${source.sd} — scroll to page slices, pick a tool from the toolbar, drag 3D to orbit`;
+  // The store: what it said (an error, a skipped sign-in, nothing for this study), then its
+  // segmentation, decoded onto the grid that exists now — while streaming, before the slices
+  // have all arrived, the same as an IDC SEG would. Not over a stack, which has no grid for it.
+  noticeForState(gcp, () => openDataSources(gcp));
+  const gsegShown = source.gseg && !stack
+    ? showSegmentation(source.gseg.seriesUID, source.gseg.description || "segmentation", { gseg: source.gseg, bytes: gsegBytes })
+    : null;
   if (!streaming) {
     await mosaic!.done();   // the whole volume was already there when the scene was built
-    status(READY);
+    if (gsegShown) await gsegShown; // it says READY itself
+    else status(READY);
     return;
   }
 
@@ -1407,6 +1534,7 @@ async function main() {
   }
 
   await loadDone;
+  volumeLoading = false;
 
   if (!streamStats.placed) throw new Error("no image slices could be placed in the volume");
   // What the index's instance count promised but the data did not deliver: a series that also

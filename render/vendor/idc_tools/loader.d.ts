@@ -8,6 +8,12 @@ export declare function loadSegmentation(prefix: string, bucket: string,
     ctLike: { dims: [number, number, number]; ijkToRAS: number[] },
     handlers?: Pick<LoadHandlers, 'onProgress' | 'onSegError' | 'onSegName'>,
     opts?: LoaderOptions): Promise<SegLabelmap | null>;
+/** loadSegmentation for a SEG already held as Part-10 bytes (e.g. fetched from a DICOMweb
+ *  store). The buffer is transferred to the worker, so the caller's copy is emptied. */
+export declare function loadSegmentationFromBuffer(buf: ArrayBuffer,
+    ctLike: { dims: [number, number, number]; ijkToRAS: number[] },
+    handlers?: Pick<LoadHandlers, 'onProgress' | 'onSegError' | 'onSegName'>,
+    opts?: LoaderOptions): Promise<SegLabelmap | null>;
 /** Decode ONE representative (middle) slice of a series into a small grayscale preview (private
  *  short-lived worker). Returns null when there's no DICOM / no pixel data / decode fails. */
 export declare function loadThumbnail(prefix: string, bucket: string, modality: string, opts?: LoaderOptions): Promise<{

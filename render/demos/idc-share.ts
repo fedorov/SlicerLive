@@ -7,12 +7,16 @@
 // Download: streams the study's DICOM straight to a user-picked folder (File System Access API),
 //           N objects in flight at once, no whole-series buffering.
 import { fetchRetry, idcS3, ohifViewerURL, s3ListKeys } from "../vendor/idc_tools/index.js";
+import { gcpShareParams } from "./gcp-source.ts";
 
 /** The BIR demo's resolved source (subset used here). */
 export interface ShareSource {
   c: string; cb: string; // image series S3 prefix + bucket
   s?: string; sb?: string; // optional SEG prefix + bucket
   m: string; col: string; st: string; sd: string; lic: string;
+  sid?: string; sgid?: string; // image + shown SEG SeriesInstanceUIDs
+  /** The `?gcp=` secondary store in use, if any (its canonical param value). */
+  gcp?: string;
 }
 /** One downloadable series (the loaded pair, or every series in the study). */
 export interface SeriesRef {
@@ -24,6 +28,12 @@ export interface SeriesRef {
  *  compatibility) AND the index-free direct-S3 params (opens straight from the bucket). */
 export function studyShareURL(src: ShareSource): string {
   const u = new URL(globalThis.location.origin + globalThis.location.pathname);
+  // With a secondary store, the shown SEG may exist only there, which the direct-S3 form can't
+  // name — so the link is the OHIF form plus the store.
+  if (src.gcp && src.st) {
+    u.search = gcpShareParams(src.st, src.sid, src.sgid, src.gcp).toString();
+    return u.toString();
+  }
   if (src.st) u.searchParams.set("StudyInstanceUIDs", src.st);
   // direct-S3 fast path (works even before/without the slim index)
   u.searchParams.set("series", src.c);
@@ -37,9 +47,9 @@ export function studyShareURL(src: ShareSource): string {
   return u.toString();
 }
 
-const OVERLAY_CSS =
+export const OVERLAY_CSS =
   "position:fixed;inset:0;z-index:2000;background:rgba(5,6,10,.85);display:flex;align-items:center;justify-content:center;";
-const CARD_CSS =
+export const CARD_CSS =
   "background:#11141d;border:1px solid #33507e;border-radius:10px;padding:20px 24px;width:600px;max-width:92vw;font:13px -apple-system,system-ui,sans-serif;color:#d6e2f2;";
 
 /** Small modal listing the SlicerLive deep link + the IDC OHIF portal link, each copyable. */
@@ -66,7 +76,9 @@ export function shareStudy(src: ShareSource): void {
     <div style="${CARD_CSS}">
       <h3 style="margin:0 0 4px;color:#fff;">Share study</h3>
       <p style="margin:0 0 16px;color:#9fb3d0;">${src.sd}${src.st ? " · " + src.st : ""}</p>
-      ${row("Open in SlicerLive (this viewer)", here, "Reopens this study in the SlicerLive BIR reader (OHIF-style + direct-S3 params).")}
+      ${row("Open in SlicerLive (this viewer)", here, src.gcp
+        ? "Reopens this study here with the same segmentation store — whoever opens it signs in with their own Google account."
+        : "Reopens this study in the SlicerLive BIR reader (OHIF-style + direct-S3 params).")}
       ${portal ? row("Open in IDC OHIF portal", portal, "The canonical IDC viewer link for the same study.") : ""}
       <div style="text-align:right;margin-top:6px;">
         <button id="idc-share-close" style="font:600 12px -apple-system,system-ui,sans-serif;color:#9fb3d0;
@@ -179,7 +191,9 @@ export async function downloadStudyWithDialog(
     <div style="${CARD_CSS.replace("width:600px", "width:560px")}">
       <h3 style="margin:0 0 4px;color:#fff;">Downloading study</h3>
       <p style="margin:0 0 6px;color:#9fb3d0;">${src.sd}${src.st ? " · " + src.st : ""}</p>
-      <p style="margin:0 0 14px;color:#5a6b85;font-size:11px;">${src.lic || "NCI Imaging Data Commons — open data"}</p>
+      <p style="margin:0 0 14px;color:#5a6b85;font-size:11px;">${src.lic || "NCI Imaging Data Commons — open data"}${
+    src.gcp ? "<br>IDC's public series only — segmentations from the Google Cloud store are not included." : ""
+  }</p>
       <div style="height:8px;background:#0b0e16;border:1px solid #1b2740;border-radius:5px;overflow:hidden;">
         <div id="idc-dl-bar" style="height:100%;width:0%;background:#2b6cb0;transition:width .2s;"></div>
       </div>

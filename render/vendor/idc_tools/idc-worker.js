@@ -277,6 +277,11 @@ function volumeFromSlices(slices) {
     return { ...v, win, lev, dtype: isPET ? 'float32' : 'int16', stack: !diag.ok };
 }
 function buildLabelmap(ds, bits, ct) {
+    // Only BINARY frames are one bit per pixel. A FRACTIONAL SEG stores a byte per pixel (and
+    // LABELMAP a label value), so reading it as a bitmask draws noise — refuse it instead.
+    const segType = String(ds.SegmentationType || 'BINARY').toUpperCase();
+    if (segType !== 'BINARY')
+        throw new Error(`${segType} segmentations are not supported yet (only BINARY)`);
     const [nx, ny, nz] = ct.dims;
     // The SEG frames have their OWN grid (DICOM Rows/Columns) and their own spacing, which need
     // NOT match the image series it is drawn over: an autoPET lesion SEG is 400x400 on the PET
@@ -670,13 +675,24 @@ async function loadSeg(segKeys, ctLike) {
         parsed = await fetchSeg(segKeys[0]);
     }
     catch (err) {
-        const buf = await fetchBuf(segKeys[0], SEG_S3);
-        const ds = naturalize(buf);
-        let pd = ds.PixelData;
-        if (Array.isArray(pd))
-            pd = pd[0];
-        parsed = { ds, bits: new Uint8Array(pd) };
+        parsed = parseSegBuffer(await fetchBuf(segKeys[0], SEG_S3));
     }
+    postLabelmap(parsed, ctLike);
+}
+
+/** A whole Part-10 SEG → { ds, bits }: what loadSeg falls back to, and what a SEG handed over
+ *  as bytes (from a DICOMweb store the main thread fetched) goes through. */
+function parseSegBuffer(buf) {
+    const ds = naturalize(buf);
+    let pd = ds.PixelData;
+    if (Array.isArray(pd))
+        pd = pd[0];
+    if (!pd)
+        throw new Error('the SEG has no PixelData');
+    return { ds, bits: new Uint8Array(pd) };
+}
+
+function postLabelmap(parsed, ctLike) {
     const seg = buildLabelmap(parsed.ds, parsed.bits, ctLike);
     post(
         { t: 'labelmap', lab: seg.lab, extra: seg.extra, colors: seg.colors, names: seg.names, terminology: seg.terminology, overlap: seg.overlap },
@@ -685,7 +701,21 @@ async function loadSeg(segKeys, ctLike) {
 }
 
 self.onmessage = async (e) => {
-    const { ctKeys, segKeys, ctBucket, segBucket, modality, thumbOnly, geometry, segOnly } = e.data;
+    const { ctKeys, segKeys, ctBucket, segBucket, modality, thumbOnly, geometry, segOnly, segBuffer } = e.data;
+    // SEG-ONLY from bytes: no S3 at all (and the worker never sees the credential that fetched
+    // them). The message is the one the user reads, so it goes out without a stack.
+    if (segOnly && segBuffer) {
+        try {
+            prog('decoding SEG…', 0.6);
+            postLabelmap(parseSegBuffer(segBuffer), segOnly);
+            post({ t: 'alldone' });
+        }
+        catch (err) {
+            console.error(err);
+            post({ t: 'error', error: String(err && err.message || err) });
+        }
+        return;
+    }
     CT_S3 = s3url(ctBucket);
     SEG_S3 = s3url(segBucket);
     MODNAME = { CT: 'CT', MR: 'MR', PT: 'PET' }[modality] || modality || 'image';
@@ -719,7 +749,8 @@ self.onmessage = async (e) => {
         post({ t: 'ct', vol: ct.vol, dims: ct.dims, ijkToRAS: ct.ijkToRAS, win: ct.win, lev: ct.lev, dtype: ct.dtype }, [ct.vol.buffer]);
         if (segKeys && segKeys.length && !ct.stack) {
             prog('fetching SEG…', 0.5);
-            await loadSeg(segKeys, ct);
+            // As on the streaming path: a SEG that can't be drawn must not take the image with it.
+            await loadSeg(segKeys, ct).catch((err) => post({ t: 'segerror', error: String(err && err.message || err) }));
         }
         post({ t: 'alldone' });
     }

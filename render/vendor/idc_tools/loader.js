@@ -116,6 +116,21 @@ export async function loadSegmentation(prefix, bucket, ctLike, handlers = {}, op
     const segKeys = await s3ListKeys(prefix, bucket);
     if (!segKeys.length)
         return null;
+    return runSegWorker({
+        ctKeys: [], segKeys, ctBucket: bucket, segBucket: bucket,
+        modality: 'SEG', segOnly: { dims: ctLike.dims, ijkToRAS: ctLike.ijkToRAS },
+    }, [], handlers, opts);
+}
+/** loadSegmentation for a SEG the caller already holds as Part-10 bytes — one fetched from a
+ *  DICOMweb store, say. The buffer is TRANSFERRED to the worker (the caller's copy is emptied). */
+export function loadSegmentationFromBuffer(buf, ctLike, handlers = {}, opts) {
+    return runSegWorker({
+        ctKeys: [], segKeys: [], modality: 'SEG', segBuffer: buf,
+        segOnly: { dims: ctLike.dims, ijkToRAS: ctLike.ijkToRAS },
+    }, [buf], handlers, opts);
+}
+/** One SEG decode in a private short-lived worker; resolves the labelmap (or null). */
+function runSegWorker(msg, transfer, handlers, opts) {
     return new Promise((resolve, reject) => {
         let w;
         try {
@@ -143,10 +158,7 @@ export async function loadSegmentation(prefix, bucket, ctLike, handlers = {}, op
             }
         };
         w.onerror = (ev) => done(() => reject(new Error('idc_tools worker: ' + (ev.message || ev))));
-        w.postMessage({
-            ctKeys: [], segKeys, ctBucket: bucket, segBucket: bucket,
-            modality: 'SEG', segOnly: { dims: ctLike.dims, ijkToRAS: ctLike.ijkToRAS },
-        });
+        w.postMessage(msg, transfer);
     });
 }
 /** Decode ONE representative (middle) slice of a series into a small grayscale preview — for the

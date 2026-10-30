@@ -53,6 +53,13 @@ export interface StripItem {
   /** This series draws OVER the loaded images rather than replacing them (a segmentation).
    *  Changes the row's tooltip, and lets the reader mark which overlay is showing. */
   overlay?: boolean;
+  /** A short badge after the modality — where the series comes from when that is not IDC
+   *  (e.g. "GCP" for a secondary DICOM store). */
+  tag?: string;
+  /** Extra tooltip line (the source's full name, or why the row can't be opened). */
+  hint?: string;
+  /** Listed but not openable here — e.g. a segmentation drawn on images this study lacks. */
+  disabled?: boolean;
   /** The series' tile, or null when there is no image to show (a report, a presentation state,
    *  a segmentation object). A null tile makes the row COMPACT — modality badge + text, no
    *  picture box — rather than a square of placeholder. */
@@ -231,6 +238,7 @@ const ICONS: Record<string, string> = {
   // IDC actions
   share: I(`<circle cx="18" cy="5" r="2.6"/><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="19" r="2.6"/><path d="M8.3 10.8l7.4-4.3M8.3 13.2l7.4 4.3"/>`),
   download: I(`<path d="M12 3v11m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>`),
+  cloud: I(`<path d="M7 18h10.5a4 4 0 00.6-7.95A6 6 0 006.3 9.2 4.4 4.4 0 007 18z"/>`),
 };
 
 const STYLE = `
@@ -265,6 +273,10 @@ const STYLE = `
 #bir-strip .item.no-thumb .cap { padding:5px 6px; }
 #bir-strip .cap .mod { flex:0 0 auto; font-weight:700; color:#cfe0f5; background:#1b2740;
   border-radius:3px; padding:0 4px; }
+#bir-strip .cap .tag { flex:0 0 auto; font-weight:700; color:#0b0e16; background:#9fd0b3;
+  border-radius:3px; padding:0 4px; }
+#bir-strip .item.disabled { opacity:.45; cursor:not-allowed; }
+#bir-strip .item.disabled:hover { border-color:#1b2740; }
 #bir-strip .cap .txt { min-width:0; overflow:hidden; text-overflow:ellipsis;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 .bir-cell-selected { outline:1px solid #2b6cb0; outline-offset:-1px; }
@@ -891,11 +903,12 @@ export function mountBir(cfg: BirCfg): BirApi {
     let currentItem: HTMLElement | null = null;
     for (const it of cfg.strip) {
       const item = document.createElement("div");
-      item.className = "item" + (it.current ? " current" : "");
+      item.className = "item" + (it.current ? " current" : "") + (it.disabled ? " disabled" : "");
       if (it.current) currentItem = item;
       item.dataset.uid = it.seriesUID;
       item.title = it.lines.join(" · ") +
-        (it.overlay ? " — click to show over the current images" : " — click to load");
+        (it.disabled ? "" : it.overlay ? " — click to show over the current images" : " — click to load") +
+        (it.hint ? "\n" + it.hint : "");
       const img = document.createElement("img");
       img.alt = "";
       // A series with no image to show (SR, SEG, RTSTRUCT, presentation state) collapses to a
@@ -916,10 +929,17 @@ export function mountBir(cfg: BirCfg): BirApi {
       const txt = document.createElement("span");
       txt.className = "txt";
       txt.textContent = (it.modality ? it.lines : it.lines.slice(1)).join(" · ");
-      cap.append(mod, txt);
+      cap.append(mod);
+      if (it.tag) {
+        const tag = document.createElement("span");
+        tag.className = "tag";
+        tag.textContent = it.tag;
+        cap.append(tag);
+      }
+      cap.append(txt);
       item.append(img, cap);
       // Single click loads the series (OHIF-style); ignore a click on the already-open one.
-      item.addEventListener("click", () => { if (!it.current) it.open(); });
+      item.addEventListener("click", () => { if (!it.current && !it.disabled) it.open(); });
       strip.appendChild(item);
     }
     // Keep the open series visible in a long list.
