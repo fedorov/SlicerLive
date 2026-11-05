@@ -5,16 +5,26 @@
 // and Slim use for `?gcp=`: the store is named by its resource path, its SEGs are merged into the
 // IDC study by StudyInstanceUID, and each one is matched to its images by ReferencedSeriesSequence.
 //
+// The same store can instead be named by `?dicomweb=`: the root of a PUBLIC DICOMweb service,
+// such as a read-only proxy in front of a Healthcare store. Everything below works the same for
+// both, except that a `dicomweb` store is read with a plain fetch: no sign-in, no token, no OAuth
+// client, no Google consent screen.
+//
 // Everything above the fetch wrappers is pure, so gcp-source.test.ts can pin it down without a
 // network. The wrappers take the fetch to use, so the token stays in gcp-auth.ts.
 
-/** A parsed `?gcp=` value. */
+/** A parsed `?gcp=` or `?dicomweb=` value. */
 export interface GcpStore {
-  /** `projects/P/locations/L/datasets/D/dicomStores/S` — what `?gcp=` carries in links. */
+  /** `gcp`: a Google Cloud Healthcare store, read with the sign-in token.
+   *  `dicomweb`: a public DICOMweb root, read without any credentials. */
+  kind: "gcp" | "dicomweb";
+  /** `projects/P/locations/L/datasets/D/dicomStores/S` — what `?gcp=` carries in links; for a
+   *  `dicomweb` store, its root URL. */
   path: string;
-  /** The store's DICOMweb root, `https://healthcare.googleapis.com/<ver>/<path>/dicomWeb`. */
+  /** The store's DICOMweb root, `https://healthcare.googleapis.com/<ver>/<path>/dicomWeb`, or
+   *  the `?dicomweb=` URL. */
   root: string;
-  /** The store id, for labels. */
+  /** The store id (for `dicomweb`, the URL's last path segment, else its host), for labels. */
   label: string;
   /** From an OHIF-style `/study/<uid>[/series/<uid>]` suffix, when the value carried one. */
   study?: string;
@@ -85,6 +95,7 @@ export function parseGcpParam(raw: string): GcpStore {
   }
   const path = `projects/${m[1]}/locations/${m[2]}/datasets/${m[3]}/dicomStores/${m[4]}`;
   return {
+    kind: "gcp",
     path,
     root: `${GHC_ORIGIN}/${ver}/${path}/dicomWeb`,
     label: m[4],
@@ -93,12 +104,57 @@ export function parseGcpParam(raw: string): GcpStore {
   };
 }
 
-/** The canonical `?gcp=` value for a store: the bare path for v1 (what OHIF links carry), the
- *  absolute URL when the store was named under a beta API version. */
+// Path segments that name the DICOMweb service rather than the store, skipped for the label.
+const SERVICE_SEGMENT = /^(dicom-?web|rs|wado|wado-?rs|qido-?rs)$/i;
+
+/** Parse `?dicomweb=`: the root of a public DICOMweb service, read with no credentials at all.
+ *  https only (http just for localhost, to test a proxy locally); no query, fragment or user
+ *  info, which would change what the URLs built from it mean. A Google Healthcare URL is
+ *  refused: it can't be read without a token, which only `?gcp=` sends. */
+export function parseDicomwebParam(raw: string): GcpStore {
+  const s = raw.trim().replace(/\/+$/, "");
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    throw new Error(`not a valid URL: ${raw}`);
+  }
+  const local = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && local)) {
+    throw new Error(`a DICOMweb root must be an https:// URL: ${raw}`);
+  }
+  if (u.origin === GHC_ORIGIN) {
+    throw new Error("a Google Cloud Healthcare store needs sign-in — name it with ?gcp= instead");
+  }
+  if (u.search || u.hash) throw new Error("a DICOMweb root can't carry a query or a fragment");
+  if (u.username || u.password) throw new Error("a DICOMweb root can't carry a user name or password");
+  const root = u.origin + u.pathname.replace(/\/+$/, "");
+  const segments = u.pathname.split("/").filter(Boolean).map((x) => decodeURIComponent(x));
+  while (segments.length && SERVICE_SEGMENT.test(segments[segments.length - 1])) segments.pop();
+  return { kind: "dicomweb", path: root, root, label: segments.pop() || u.hostname };
+}
+
+/** The URL parameter that names the store: `gcp` or `dicomweb`. */
+export function storeParamName(store: GcpStore): "gcp" | "dicomweb" {
+  return store.kind;
+}
+
+/** The canonical parameter value for a store. For `?gcp=`: the bare path for v1 (what OHIF links
+ *  carry), the absolute URL when the store was named under a beta API version. For `?dicomweb=`:
+ *  its root URL. */
 export function gcpParamValue(store: GcpStore): string {
+  if (store.kind === "dicomweb") return store.root;
   return store.root === `${GHC_ORIGIN}/v1/${store.path}/dicomWeb`
     ? store.path
     : store.root.replace(/\/dicomWeb$/, "");
+}
+
+/** Parse a store as typed into the Data sources dialog, or kept in the recent list: a URL that
+ *  is not Google Healthcare's is a public DICOMweb root, anything else a `?gcp=` value. */
+export function parseStoreInput(raw: string): GcpStore {
+  const s = raw.trim();
+  if (/^https?:\/\//i.test(s) && !s.toLowerCase().startsWith(GHC_ORIGIN + "/")) return parseDicomwebParam(s);
+  return parseGcpParam(s);
 }
 
 // The instance-level QIDO's fields. GHC returns only the default attributes unless asked, and the
@@ -233,12 +289,18 @@ export function stripSegs(segs: GcpSeg[], idcSeries: Set<string>): GcpSeg[] {
 
 /** Share-link params when a store is in use. The direct-S3 `series=` form can't name a SEG that
  *  lives outside IDC and drops the series strip, so the link is the OHIF form plus the store. */
-export function gcpShareParams(st: string, sid: string | undefined, sgid: string | undefined, gcp: string): URLSearchParams {
+export function gcpShareParams(
+  st: string,
+  sid: string | undefined,
+  sgid: string | undefined,
+  gcp: string,
+  param: "gcp" | "dicomweb" = "gcp",
+): URLSearchParams {
   const q = new URLSearchParams();
   q.set("StudyInstanceUIDs", st);
   const sel = [sid, sgid].filter(Boolean).join(",");
   if (sel) q.set("SeriesInstanceUIDs", sel);
-  q.set("gcp", gcp);
+  q.set(param, gcp);
   return q;
 }
 
@@ -284,6 +346,9 @@ export function part10TransferSyntax(buf: ArrayBuffer): string | null {
 
 export type GFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
+/** fetch() for a `?dicomweb=` store: no token, no cookies — nothing that identifies the reader. */
+export const publicFetch: GFetch = (url, init = {}) => fetch(url, { ...init, credentials: "omit" });
+
 /** Every SEG series the store holds for a study, in one instance-level QIDO. */
 export async function listSegs(store: GcpStore, studyUID: string, gfetch: GFetch): Promise<GcpSeg[]> {
   if (!UID_RE.test(studyUID)) throw new Error(`not a DICOM UID: ${studyUID}`);
@@ -294,7 +359,7 @@ export async function listSegs(store: GcpStore, studyUID: string, gfetch: GFetch
   });
   // GHC answers an empty search with 204 and no body, not an empty array.
   if (r.status === 204 || r.status === 404) return [];
-  if (!r.ok) throw new Error(await httpError(r, "searching the store"));
+  if (!r.ok) throw new Error(await httpError(r, "searching the store", store));
   const rows = await r.json();
   return qidoToSegs(Array.isArray(rows) ? rows : []);
 }
@@ -318,7 +383,7 @@ export async function fetchSegInstance(
   const url = `${store.root}/studies/${studyUID}/series/${seg.seriesUID}/instances/${seg.sopUID}`;
   const get = async (ts: string) => {
     const r = await gfetch(url, { headers: { Accept: `application/dicom; transfer-syntax=${ts}` } });
-    if (!r.ok) throw Object.assign(new Error(await httpError(r, "fetching the segmentation")), { status: r.status });
+    if (!r.ok) throw Object.assign(new Error(await httpError(r, "fetching the segmentation", store)), { status: r.status });
     return await readWithProgress(r, onProgress);
   };
   let buf: ArrayBuffer;
@@ -363,7 +428,7 @@ async function readWithProgress(
   return out.buffer;
 }
 
-async function httpError(r: Response, what: string): Promise<string> {
+async function httpError(r: Response, what: string, store: GcpStore): Promise<string> {
   let detail = "";
   try {
     const t = await r.text();
@@ -373,10 +438,14 @@ async function httpError(r: Response, what: string): Promise<string> {
       detail = t;
     }
   } catch { /* no body */ }
+  const google = store.kind === "gcp";
   const hint = r.status === 403
-    ? " — your Google account needs read access to this store (roles/healthcare.dicomViewer)"
+    ? google
+      ? " — your Google account needs read access to this store (roles/healthcare.dicomViewer)"
+      : " — the DICOMweb service refused access"
     : r.status === 404
-    ? " — check the store path"
+    ? google ? " — check the store path" : " — check the DICOMweb URL"
     : "";
-  return `Google Healthcare ${r.status} ${what}${hint}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
+  const who = google ? "Google Healthcare" : `DICOMweb (${store.label})`;
+  return `${who} ${r.status} ${what}${hint}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
 }

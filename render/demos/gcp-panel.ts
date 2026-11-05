@@ -1,8 +1,11 @@
-// gcp-panel.ts — the reader-facing side of the `?gcp=` secondary source:
+// gcp-panel.ts — the reader-facing side of the secondary source of segmentations, named by
+// `?gcp=` (a Google Cloud Healthcare store, read with a sign-in token) or `?dicomweb=` (a public
+// DICOMweb root, e.g. a read-only proxy in front of such a store, read with no credentials):
 //   connectGcp       — before the study opens: sign in (or not), then list the store's SEGs.
-//   the sign-in gate — shown only when a link names a store and there is no token. Its button
-//                      is the user gesture Google's popup needs, which is why it comes BEFORE the
-//                      images rather than as a strip row that appears later.
+//                      A `?dicomweb=` store skips straight to the listing.
+//   the sign-in gate — shown only when a link names a `?gcp=` store and there is no token. Its
+//                      button is the user gesture Google's popup needs, which is why it comes
+//                      BEFORE the images rather than as a strip row that appears later.
 //   openDataSources  — the toolbar dialog: which sources are in use, paste or pick a store,
 //                      sign in or out. Changing the store reloads, like changing series does.
 import {
@@ -16,12 +19,23 @@ import {
   signOut,
   tokenInfo,
 } from "./gcp-auth.ts";
-import { type GcpSeg, type GcpStore, gcpParamValue, listSegs, parseGcpParam } from "./gcp-source.ts";
+import {
+  type GcpSeg,
+  type GcpStore,
+  type GFetch,
+  gcpParamValue,
+  listSegs,
+  parseDicomwebParam,
+  parseGcpParam,
+  parseStoreInput,
+  publicFetch,
+  storeParamName,
+} from "./gcp-source.ts";
 import { CARD_CSS, OVERLAY_CSS } from "./idc-share.ts";
 
 /** What the store contributed to this page load. */
 export interface GcpState {
-  /** `?gcp=` as given; null when the page has none. */
+  /** `?dicomweb=` or `?gcp=` as given; null when the page has neither. */
   raw: string | null;
   store: GcpStore | null;
   segs: GcpSeg[];
@@ -31,17 +45,33 @@ export interface GcpState {
   skipped?: boolean;
 }
 
-const RECENT_KEY = "slicerrad:gcp-recent"; // store paths only — never a token
+const RECENT_KEY = "slicerrad:gcp-recent"; // store paths and DICOMweb URLs only — never a token
+const INPUT_HINT = "A Google Cloud store path or its https://healthcare.googleapis.com/… URL (sign-in), " +
+  "or the https:// root of a public DICOMweb service (no sign-in).";
 const MAX_RECENT = 8;
 const skipKey = (s: GcpStore) => `slicerrad:gcp-skip:${s.path}`;
 
-export function readGcpParam(raw: string | null): GcpState {
-  if (raw == null || !raw.trim()) return { raw: null, store: null, segs: [] };
+/** The page's secondary store: `?dicomweb=` if given (it needs no sign-in), else `?gcp=`. */
+export function readStoreParam(params: URLSearchParams): GcpState {
+  const dicomweb = params.get("dicomweb");
+  const gcp = params.get("gcp");
+  const [raw, parse] = dicomweb?.trim()
+    ? [dicomweb, parseDicomwebParam]
+    : gcp?.trim()
+    ? [gcp, parseGcpParam]
+    : [null, null];
+  if (raw == null || !parse) return { raw: null, store: null, segs: [] };
+  if (dicomweb?.trim() && gcp?.trim()) console.warn("[gcp] both ?dicomweb= and ?gcp= given; using ?dicomweb=");
   try {
-    return { raw, store: parseGcpParam(raw), segs: [] };
+    return { raw, store: parse(raw), segs: [] };
   } catch (e) {
     return { raw, store: null, segs: [], error: (e as Error).message };
   }
+}
+
+/** The fetch a store is read with: the Google token for `?gcp=`, nothing at all for `?dicomweb=`. */
+export function fetchFor(store: GcpStore): GFetch {
+  return store.kind === "dicomweb" ? publicFetch : gcpFetch;
 }
 
 /** Sign in if needed (the gate), then list the store's SEGs for the study. Never throws: a store
@@ -49,6 +79,18 @@ export function readGcpParam(raw: string | null): GcpState {
 export async function connectGcp(st: GcpState, studyUID: string, onStatus: (m: string) => void): Promise<GcpState> {
   const store = st.store;
   if (!store) return st;
+  if (store.kind === "dicomweb") {
+    // Public: no gate, no token, no Google sign-in script.
+    onStatus(`searching ${store.label} for segmentations…`);
+    try {
+      const segs = await listSegs(store, studyUID, publicFetch);
+      remember(store);
+      return { ...st, segs };
+    } catch (e) {
+      console.warn("[dicomweb]", e);
+      return { ...st, error: (e as Error).message };
+    }
+  }
   for (let attempt = 0;; attempt++) {
     if (!hasValidToken()) {
       if (session(skipKey(store))) return { ...st, skipped: true };
@@ -136,14 +178,14 @@ export function openDataSources(state: GcpState): void {
       <p>NCI Imaging Data Commons — public, no sign-in. Images and IDC's own segmentations.</p>
     </div>
     <div class="sec">
-      <div class="lbl">Secondary — segmentations from Google Cloud</div>
+      <div class="lbl">Secondary — segmentations from a DICOM store</div>
       <div data-current></div>
       <div class="row" style="margin-top:8px;">
         <input data-input spellcheck="false" autocomplete="off"
-          placeholder="projects/…/locations/…/datasets/…/dicomStores/…">
+          placeholder="projects/…/dicomStores/…  or  https://… (public DICOMweb)">
         <button class="primary" data-act="apply" disabled>Apply</button>
       </div>
-      <p class="dim" data-valid style="margin-top:4px;">A store path or its https://healthcare.googleapis.com/… URL.</p>
+      <p class="dim" data-valid style="margin-top:4px;">${INPUT_HINT}</p>
       <div data-recent></div>
     </div>
     <div class="sec">
@@ -164,6 +206,8 @@ export function openDataSources(state: GcpState): void {
       ? `<p class="err">${esc(state.error)}</p>`
       : state.skipped
       ? `<p class="warn">Not signed in — its segmentations aren't shown. Sign in below.</p>`
+      : state.store.kind === "dicomweb"
+      ? `<p>Public DICOMweb, no sign-in. ${state.segs.length ? `${state.segs.length} segmentation series for this study.` : "No segmentations for this study."}</p>`
       : `<p>${state.segs.length ? `${state.segs.length} segmentation series for this study.` : "No segmentations for this study."}</p>`;
     cur.innerHTML = `<p class="mono">${esc(state.store.path)}</p>${what}
       <div class="row"><button data-act="remove">Remove</button></div>`;
@@ -180,17 +224,19 @@ export function openDataSources(state: GcpState): void {
     const v = input.value.trim();
     parsed = null;
     valid.className = "dim";
-    if (!v) valid.textContent = "A store path or its https://healthcare.googleapis.com/… URL.";
+    if (!v) valid.textContent = INPUT_HINT;
     else {
       try {
-        parsed = parseGcpParam(v);
-        valid.textContent = `✓ ${parsed.label} (project ${parsed.path.split("/")[1]})`;
+        parsed = parseStoreInput(v);
+        valid.textContent = parsed.kind === "dicomweb"
+          ? `✓ ${parsed.label} (public DICOMweb at ${new URL(parsed.root).host}, no sign-in)`
+          : `✓ ${parsed.label} (project ${parsed.path.split("/")[1]})`;
       } catch (e) {
         valid.textContent = (e as Error).message;
         valid.className = "err";
       }
     }
-    applyBtn.disabled = !parsed || parsed.path === state.store?.path;
+    applyBtn.disabled = !parsed || parsed.root === state.store?.root;
   });
   input.addEventListener("keydown", (e) => e.key === "Enter" && !applyBtn.disabled && applyBtn.click());
   applyBtn.addEventListener("click", () => parsed && go(parsed, state));
@@ -203,14 +249,17 @@ export function openDataSources(state: GcpState): void {
     for (const v of list) {
       let s: GcpStore;
       try {
-        s = parseGcpParam(v);
+        s = parseStoreInput(v);
       } catch {
         continue;
       }
+      const where = s.kind === "dicomweb"
+        ? `DICOMweb · ${new URL(s.root).host}`
+        : `${s.path.split("/")[1]} · ${s.path.split("/")[5]}`;
       const r = document.createElement("div");
       r.className = "row recent";
       r.innerHTML = `<button class="pick" title="${esc(s.path)}"><b>${esc(s.label)}</b>
-        <span class="dim">${esc(s.path.split("/")[1])} · ${esc(s.path.split("/")[5])}</span></button>
+        <span class="dim">${esc(where)}</span></button>
         <button class="link" title="Forget this store">✕</button>`;
       const [pick, forget] = r.querySelectorAll("button");
       pick.addEventListener("click", () => go(s, state));
@@ -237,7 +286,8 @@ export function openDataSources(state: GcpState): void {
       authEl.querySelector("[data-act=signout]")!.addEventListener("click", () => signOut());
       return;
     }
-    authEl.innerHTML = `<p>Not signed in. Public IDC data needs no sign-in; a Google Cloud store does.</p>
+    authEl.innerHTML = `<p>Not signed in. Public IDC data and public DICOMweb stores need no sign-in;
+        a Google Cloud store does.</p>
       ${id ? "" : `<p class="dim">Sign-in isn't configured for this deployment (no OAuth client ID).</p>`}
       <p class="err" data-err hidden></p>
       <div class="row"><button class="primary" data-act="signin" ${id ? "" : "disabled"}>Sign in with Google</button></div>`;
@@ -247,7 +297,7 @@ export function openDataSources(state: GcpState): void {
       b.disabled = true;
       signIn().then(() => {
         // The store this page was opened with was skipped or refused: read it now.
-        if (state.store && (state.skipped || state.error)) {
+        if (state.store?.kind === "gcp" && (state.skipped || state.error)) {
           session(skipKey(state.store), null);
           location.reload();
         }
@@ -283,11 +333,13 @@ function go(store: GcpStore | null, state: GcpState): void {
     if (keep.length) u.searchParams.set(k, keep.join(","));
     else u.searchParams.delete(k);
   }
+  u.searchParams.delete("gcp");
+  u.searchParams.delete("dicomweb");
   if (store) {
     session(skipKey(store), null);
-    u.searchParams.set("gcp", gcpParamValue(store));
+    u.searchParams.set(storeParamName(store), gcpParamValue(store));
     if (store.study && !u.searchParams.get("StudyInstanceUIDs")) u.searchParams.set("StudyInstanceUIDs", store.study);
-  } else u.searchParams.delete("gcp");
+  }
   location.href = u.toString();
 }
 
@@ -335,7 +387,7 @@ export function storeNotice(text: string, warn: boolean, action?: { label: strin
 /** The banner for how the store's part of this page load went, if it needs one. */
 export function noticeForState(state: GcpState, open: () => void): void {
   if (state.raw == null) return;
-  const name = state.store?.label ?? "the Google Cloud store";
+  const name = state.store?.label ?? "the segmentation store";
   const dlg = { label: "Data sources…", run: open };
   if (state.error) {
     storeNotice(`Segmentations from ${name} aren't shown — ${state.error}`, true, dlg);

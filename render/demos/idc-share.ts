@@ -15,8 +15,10 @@ export interface ShareSource {
   s?: string; sb?: string; // optional SEG prefix + bucket
   m: string; col: string; st: string; sd: string; lic: string;
   sid?: string; sgid?: string; // image + shown SEG SeriesInstanceUIDs
-  /** The `?gcp=` secondary store in use, if any (its canonical param value). */
+  /** The secondary store in use, if any (its canonical param value)... */
   gcp?: string;
+  /** ...and the parameter that carries it: `gcp` (Google sign-in) or `dicomweb` (public). */
+  storeParam?: "gcp" | "dicomweb";
 }
 /** One downloadable series (the loaded pair, or every series in the study). */
 export interface SeriesRef {
@@ -31,7 +33,7 @@ export function studyShareURL(src: ShareSource): string {
   // With a secondary store, the shown SEG may exist only there, which the direct-S3 form can't
   // name — so the link is the OHIF form plus the store.
   if (src.gcp && src.st) {
-    u.search = gcpShareParams(src.st, src.sid, src.sgid, src.gcp).toString();
+    u.search = gcpShareParams(src.st, src.sid, src.sgid, src.gcp, src.storeParam ?? "gcp").toString();
     return u.toString();
   }
   if (src.st) u.searchParams.set("StudyInstanceUIDs", src.st);
@@ -77,7 +79,9 @@ export function shareStudy(src: ShareSource): void {
       <h3 style="margin:0 0 4px;color:#fff;">Share study</h3>
       <p style="margin:0 0 16px;color:#9fb3d0;">${src.sd}${src.st ? " · " + src.st : ""}</p>
       ${row("Open in SlicerLive (this viewer)", here, src.gcp
-        ? "Reopens this study here with the same segmentation store — whoever opens it signs in with their own Google account."
+        ? src.storeParam === "dicomweb"
+          ? "Reopens this study here with the same public DICOMweb segmentation store — no sign-in needed."
+          : "Reopens this study here with the same segmentation store — whoever opens it signs in with their own Google account."
         : "Reopens this study in the SlicerLive BIR reader (OHIF-style + direct-S3 params).")}
       ${portal ? row("Open in IDC OHIF portal", portal, "The canonical IDC viewer link for the same study.") : ""}
       <div style="text-align:right;margin-top:6px;">
@@ -192,7 +196,11 @@ export async function downloadStudyWithDialog(
       <h3 style="margin:0 0 4px;color:#fff;">Downloading study</h3>
       <p style="margin:0 0 6px;color:#9fb3d0;">${src.sd}${src.st ? " · " + src.st : ""}</p>
       <p style="margin:0 0 14px;color:#5a6b85;font-size:11px;">${src.lic || "NCI Imaging Data Commons — open data"}${
-    src.gcp ? "<br>IDC's public series only — segmentations from the Google Cloud store are not included." : ""
+    src.gcp
+      ? `<br>IDC's public series only — segmentations from the ${
+        src.storeParam === "dicomweb" ? "DICOMweb" : "Google Cloud"
+      } store are not included.`
+      : ""
   }</p>
       <div style="height:8px;background:#0b0e16;border:1px solid #1b2740;border-radius:5px;overflow:hidden;">
         <div id="idc-dl-bar" style="height:100%;width:0%;background:#2b6cb0;transition:width .2s;"></div>

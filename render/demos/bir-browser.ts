@@ -27,9 +27,9 @@ import type { Box, HandleMeta } from "./roi-widget.ts";
 import { createMosaic } from "./mosaic.ts";
 import { installChrome, type VizControl } from "./sl-chrome.ts";
 import { loadSegmentation, loadSegmentationFromBuffer, loadSeries, loadThumbnail } from "../vendor/idc_tools/index.js";
-import { chooseSeg, fetchSegInstance, type GcpSeg, gcpParamValue, segAction, stripSegs } from "./gcp-source.ts";
-import { AuthError, gcpFetch, takeUrlToken } from "./gcp-auth.ts";
-import { connectGcp, type GcpState, noticeForState, openDataSources, readGcpParam, storeNotice } from "./gcp-panel.ts";
+import { chooseSeg, fetchSegInstance, type GcpSeg, gcpParamValue, segAction, storeParamName, stripSegs } from "./gcp-source.ts";
+import { AuthError, takeUrlToken } from "./gcp-auth.ts";
+import { connectGcp, fetchFor, type GcpState, noticeForState, openDataSources, readStoreParam, storeNotice } from "./gcp-panel.ts";
 import type { CTVolume, GeomCheck, SegLabelmap, SeriesGeometry } from "../vendor/idc_tools/types.js";
 import { type BirApi, mountBir, type Plane, type StripItem } from "./bir.ts";
 import { downloadStudyWithDialog, type SeriesRef, shareStudy } from "./idc-share.ts";
@@ -47,6 +47,8 @@ import type { Vec3 } from "../mat4.ts";
 // Either UID form can add a secondary store of segmentations, as IDC's OHIF and Slim do:
 //   &gcp=projects/<p>/locations/<l>/datasets/<d>/dicomStores/<s>   (Google Cloud Healthcare;
 //   sign-in via gcp-auth.ts, `&token=` for testing; its SEGs join the study by UID)
+//   &dicomweb=https://<public DICOMweb root>   (e.g. a read-only proxy in front of such a store:
+//   the same SEGs, with no sign-in, OAuth client or consent screen)
 const P = new URLSearchParams(location.search);
 
 interface Source {
@@ -270,7 +272,7 @@ async function resolveSource(onStatus: (m: string) => void): Promise<Source> {
     };
   }
   takeUrlToken(); // off the address bar before anything else can see it
-  gcp = readGcpParam(P.get("gcp"));
+  gcp = readStoreParam(P);
   const studyUIDs = [...splitList(P.get("StudyInstanceUIDs")), ...splitList(P.get("studyUID"))];
   if (!studyUIDs.length && gcp.store?.study) studyUIDs.push(gcp.store.study); // OHIF's suffix form
   if (studyUIDs.length) {
@@ -530,7 +532,7 @@ async function main() {
   // as there is a grid to decode it onto. Progress is wired up once the reader can show it.
   let gsegSay: ((p: { msg: string; frac?: number }) => void) | null = null;
   const gsegBytes = source.gseg && gcp.store
-    ? fetchSegInstance(gcp.store, source.st, source.gseg, gcpFetch, (p) => gsegSay?.(p))
+    ? fetchSegInstance(gcp.store, source.st, source.gseg, fetchFor(gcp.store), (p) => gsegSay?.(p))
     : null;
   gsegBytes?.catch(() => {}); // reported by showSegmentation, which awaits it
 
@@ -896,8 +898,9 @@ async function main() {
    *  scene already exists, so the SEG decodes against the volume's own grid and attaches to it;
    *  nothing else moves. The URL is updated in place so the link still describes what is shown.
    *
-   *  `from` is an IDC SEG (S3 prefix + bucket) or a `?gcp=` store SEG, whose bytes come over
-   *  DICOMweb with the sign-in token and are handed to the decoder as one buffer.
+   *  `from` is an IDC SEG (S3 prefix + bucket) or a SEG from the `?gcp=` / `?dicomweb=` store,
+   *  whose bytes come over DICOMweb (with the sign-in token for `?gcp=`, with none for
+   *  `?dicomweb=`) and are handed to the decoder as one buffer.
    */
   let segSwapping = false;
   const showSegmentation = async (
@@ -918,7 +921,7 @@ async function main() {
       let sg: SegLabelmap | null;
       if ("gseg" in from) {
         gsegSay = onProgress;
-        const buf = await (from.bytes ?? fetchSegInstance(gcp.store!, source.st, from.gseg, gcpFetch, onProgress));
+        const buf = await (from.bytes ?? fetchSegInstance(gcp.store!, source.st, from.gseg, fetchFor(gcp.store!), onProgress));
         sg = await loadSegmentationFromBuffer(buf, grid, { onProgress });
         if (!sg) throw new Error("the segmentation decoded to nothing");
         source.gseg = from.gseg;
@@ -957,7 +960,7 @@ async function main() {
         // A banner rather than the status line: a store error (access, sign-in, a SEG the
         // decoder can't read) is something to act on, and it shouldn't scroll away in 6 s.
         storeNotice(
-          `Couldn't load ${label} from the Google Cloud store: ${msg}`,
+          `Couldn't load ${label} from ${gcp.store?.kind === "dicomweb" ? "the DICOMweb store" : "the Google Cloud store"}: ${msg}`,
           true,
           e instanceof AuthError ? { label: "Sign in", run: () => openDataSources(gcp) } : undefined,
         );
@@ -978,8 +981,12 @@ async function main() {
     for (const k of ["series", "seg", "bucket", "segBucket", "modality", "initialSeriesInstanceUID", "seriesUID"]) u.searchParams.delete(k);
     location.href = u.toString();
   };
-  /** The source as Share and Download see it: with the `?gcp=` store, when one is in use. */
-  const withStore = () => ({ ...source, gcp: gcp.store ? gcpParamValue(gcp.store) : undefined });
+  /** The source as Share and Download see it: with the `?gcp=` / `?dicomweb=` store, when one is in use. */
+  const withStore = () => ({
+    ...source,
+    gcp: gcp.store ? gcpParamValue(gcp.store) : undefined,
+    storeParam: gcp.store ? storeParamName(gcp.store) : undefined,
+  });
 
   // Build the strip from the study's every series (image stacks + SEG + SR/PR/…), OHIF-ordered
   // by SeriesNumber. Free when we arrived by StudyInstanceUID (readStudyRows is memoized); the
@@ -1030,8 +1037,9 @@ async function main() {
               : navigateToSeries(String(r.SeriesInstanceUID)),
         };
       });
-      // The `?gcp=` store's segmentations lead the strip: they are what this page was opened to
-      // review. Text rows, like IDC's SEGs, tagged so it's clear where each one lives.
+      // The store's segmentations lead the strip: they are what this page was opened to review.
+      // Text rows, like IDC's SEGs, tagged so it's clear where each one lives (GCP for a Google
+      // Cloud store, WEB for a public DICOMweb one).
       if (gcp.store) {
         const store = gcp.store;
         const imgs = new Set(rows.filter((r) => IMG.has(String(r.Modality).toUpperCase())).map((r) => String(r.SeriesInstanceUID)));
@@ -1042,8 +1050,9 @@ async function main() {
             seriesUID: g.seriesUID,
             modality: "SEG",
             overlay: true,
-            tag: "GCP",
-            hint: `Google Cloud: ${store.path}` + (act.kind === "none" ? `\n${act.why}` : ""),
+            tag: store.kind === "dicomweb" ? "WEB" : "GCP",
+            hint: (store.kind === "dicomweb" ? `DICOMweb: ${store.root}` : `Google Cloud: ${store.path}`) +
+              (act.kind === "none" ? `\n${act.why}` : ""),
             lines: [...(g.description ? [g.description] : []), `${g.instances} inst`],
             current: false,
             disabled: act.kind === "none",
@@ -1113,7 +1122,7 @@ async function main() {
       {
         id: "gcp-sources",
         icon: "cloud",
-        title: "Data sources — add segmentations from a Google Cloud DICOM store",
+        title: "Data sources — add segmentations from a Google Cloud or public DICOMweb store",
         run: () => openDataSources(gcp),
       },
     ],

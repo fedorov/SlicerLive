@@ -1,4 +1,5 @@
-// T1: the `?gcp=` secondary source — parsing every IDC viewer form, QIDO rows → SEG entries, the
+// T1: the `?gcp=` / `?dicomweb=` secondary source — parsing every IDC viewer form and public
+// DICOMweb roots, QIDO rows → SEG entries, the
 // default segmentation choice, the strip's row actions, the share params, and the Part-10
 // transfer-syntax sniff. Fixtures are shaped like the real GHC answers for cmb_mel MSB-01652.
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
@@ -8,10 +9,13 @@ import {
   gcpParamValue,
   gcpShareParams,
   orderSegs,
+  parseDicomwebParam,
   parseGcpParam,
+  parseStoreInput,
   part10TransferSyntax,
   qidoToSegs,
   segAction,
+  storeParamName,
   stripSegs,
 } from "./gcp-source.ts";
 
@@ -29,6 +33,8 @@ Deno.test("parseGcpParam: the bare OHIF path", () => {
   assertEquals(s.root, ROOT);
   assertEquals(s.label, "idc-segmentations-20261014");
   assertEquals(s.study, undefined);
+  assertEquals(s.kind, "gcp");
+  assertEquals(storeParamName(s), "gcp");
 });
 
 Deno.test("parseGcpParam: leading slash, trailing slash, whitespace", () => {
@@ -222,6 +228,58 @@ Deno.test("gcpShareParams: OHIF form + store, round-trips through parseGcpParam"
   const back = new URLSearchParams(q.toString());
   assertEquals(parseGcpParam(back.get("gcp")!).path, PATH);
   assertEquals(gcpShareParams(ST, LUNG, undefined, PATH).get("SeriesInstanceUIDs"), LUNG);
+});
+
+// --- ?dicomweb= -----------------------------------------------------------------------------
+
+const PROXY = "https://northamerica-northeast1-idc-external-031.cloudfunctions.net/cloudsegmentator_proxy";
+
+Deno.test("parseDicomwebParam: a public proxy root — kind, root, label, param", () => {
+  const s = parseDicomwebParam(PROXY);
+  assertEquals(s.kind, "dicomweb");
+  assertEquals(s.root, PROXY);
+  assertEquals(s.path, PROXY);
+  assertEquals(s.label, "cloudsegmentator_proxy");
+  assertEquals(storeParamName(s), "dicomweb");
+  assertEquals(gcpParamValue(s), PROXY);
+  assertEquals(parseDicomwebParam(` ${PROXY}/ `).root, PROXY);
+});
+
+Deno.test("parseDicomwebParam: the label skips service segments, falls back to the host", () => {
+  assertEquals(parseDicomwebParam("https://pacs.example.org/orthanc/dicom-web").label, "orthanc");
+  assertEquals(parseDicomwebParam("https://pacs.example.org/store1/dicomWeb/").label, "store1");
+  assertEquals(parseDicomwebParam("https://pacs.example.org/rs").label, "pacs.example.org");
+  assertEquals(parseDicomwebParam("https://pacs.example.org").root, "https://pacs.example.org");
+});
+
+Deno.test("parseDicomwebParam: https only, http just for localhost", () => {
+  assertThrows(() => parseDicomwebParam("http://pacs.example.org/dicomweb"), Error, "https://");
+  assertThrows(() => parseDicomwebParam("ftp://pacs.example.org/dicomweb"), Error, "https://");
+  assertEquals(parseDicomwebParam("http://localhost:8080").root, "http://localhost:8080");
+  assertEquals(parseDicomwebParam("http://127.0.0.1:8089/x").label, "x");
+});
+
+Deno.test("parseDicomwebParam: refuses Google Healthcare, queries, fragments, credentials", () => {
+  assertThrows(() => parseDicomwebParam(ROOT), Error, "?gcp=");
+  assertThrows(() => parseDicomwebParam(`${PROXY}?x=1`), Error, "query");
+  assertThrows(() => parseDicomwebParam(`${PROXY}#x`), Error, "query");
+  assertThrows(() => parseDicomwebParam("https://user:pw@pacs.example.org/dicomweb"), Error, "user name");
+  assertThrows(() => parseDicomwebParam(PATH), Error, "not a valid URL");
+});
+
+Deno.test("parseStoreInput: Google paths and URLs are ?gcp=, any other URL is ?dicomweb=", () => {
+  assertEquals(parseStoreInput(PATH).kind, "gcp");
+  assertEquals(parseStoreInput(ROOT).kind, "gcp");
+  assertEquals(parseStoreInput(PROXY).kind, "dicomweb");
+  assertThrows(() => parseStoreInput("http://pacs.example.org"), Error, "https://");
+});
+
+Deno.test("gcpShareParams: ?dicomweb= form round-trips through parseDicomwebParam", () => {
+  const q = gcpShareParams(ST, LUNG, "9.911", PROXY, "dicomweb");
+  assertEquals(q.has("gcp"), false);
+  const back = new URLSearchParams(q.toString());
+  assertEquals(parseDicomwebParam(back.get("dicomweb")!).root, PROXY);
+  assertEquals(back.get("SeriesInstanceUIDs"), `${LUNG},9.911`);
 });
 
 // --- part10TransferSyntax ---------------------------------------------------------------------
