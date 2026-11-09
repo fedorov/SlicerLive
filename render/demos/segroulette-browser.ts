@@ -186,6 +186,7 @@ async function main() {
       list: () => (rs?.segments ?? []).map((s) => ({ num: s.num, name: s.name, color: s.color })),
       get: (num) => rs?.segmentOpacity(num) ?? 1,
       set: (num, o) => { rs?.setSegmentOpacity(num, o); redrawSlices(); draw3d(); xhair?.redraw(); },
+      setMany: (entries) => { rs?.setSegmentOpacities(entries); redrawSlices(); draw3d(); xhair?.redraw(); },
       enabled: () => !!(rs?.hasSeg) && ((rs?.segOpacity() ?? 0) > 0 || (rs?.volumeOpacity() ?? 0) > 0),
     },
   });

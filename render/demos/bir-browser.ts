@@ -1456,6 +1456,10 @@ async function main() {
         sc.setSegmentOpacity(num, o);
         drawAll();
       },
+      setMany: (entries) => {
+        sc.setSegmentOpacities(entries);
+        drawAll();
+      },
       enabled: () => sc.hasSeg,
       // A DICOM SEG may define overlapping segments. They are decoded into separate label
       // layers and composited, so the shared region reads as the blend of its segments and

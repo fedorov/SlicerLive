@@ -59,7 +59,10 @@ export interface SegmentControls {
   list: () => SegInfo[];              // the current case's segments (re-read each time the popup opens)
   get: (num: number) => number;       // current opacity 0..1
   set: (num: number, o: number) => void;  // set opacity (continuous; hot-updates while dragging)
-  enabled?: () => boolean;            // dim the whole section when there's nothing to toggle
+  /** Set many opacities at once (the filter's "Show only matches" / "Show all") — one rebake
+   *  instead of one per segment. Falls back to calling set() per entry. */
+  setMany?: (entries: [number, number][]) => void;
+  enabled?: () => boolean;           // dim the whole section when there's nothing to toggle
   /** One line under the list, for something true of the segmentation as a whole rather than of
    *  one segment — e.g. that segments overlap and only the topmost is shown. null = nothing. */
   note?: () => string | null;
@@ -451,10 +454,99 @@ export function installChrome(opts: ChromeOpts): Chrome {
   // ---- per-segment opacity (swatch + tri-state box), rebuilt from the current case on each open ----
   const segHost = document.createElement("div");
   pop.appendChild(segHost);
-  const segRows: { num: number; name: string; box: HTMLElement; color: [number, number, number]; paint: () => void }[] = [];
+  const segRows: { num: number; name: string; box: HTMLElement; color: [number, number, number]; paint: () => void; row: HTMLElement }[] = [];
+
+  // ---- segment filter: a text box over a long list (a TotalSegmentator SEG has ~100 segments) ----
+  // Built ONCE and kept outside the rebuilt list, so a rebuild (each popup open, or a SEG that
+  // attaches mid-stream) neither loses the typed text nor steals focus from the box.
+  // Terms separated by commas match ANY ("kidney, tumor"); each term is a case-insensitive substring.
+  const SEG_FILTER_MIN = 7;   // the same length at which the list starts to scroll
+  const segFilterBar = document.createElement("div");
+  segFilterBar.style.cssText = "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);padding-top:7px;";
+  segFilterBar.hidden = true;
+  const segFilter = document.createElement("input");
+  segFilter.type = "search";
+  segFilter.placeholder = "Filter segments (a, b = either)";
+  segFilter.spellcheck = false;
+  segFilter.autocomplete = "off";
+  segFilter.style.cssText = "box-sizing:border-box;width:100%;padding:5px 8px;border-radius:7px;outline:none;" +
+    "font:500 12.5px -apple-system,system-ui,sans-serif;color:#eaf0ff;background:rgba(255,255,255,.08);" +
+    "border:1px solid rgba(255,255,255,.20);";
+  segFilter.onfocus = () => { segFilter.style.borderColor = "#54c6f0"; };
+  segFilter.onblur = () => { segFilter.style.borderColor = "rgba(255,255,255,.20)"; };
+  const segFilterInfo = document.createElement("div");
+  segFilterInfo.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:5px;" +
+    "font:500 11px -apple-system,system-ui,sans-serif;color:rgba(234,240,255,.65);";
+  const segCount = document.createElement("span");
+  const segActions = document.createElement("span");
+  segActions.style.cssText = "display:flex;gap:6px;";
+  const actionBtn = (text: string, title: string, run: () => void) => {
+    const b = document.createElement("span");
+    b.textContent = text; b.title = title;
+    b.style.cssText = "cursor:pointer;border-radius:6px;padding:2px 7px;white-space:nowrap;color:#9fe9ff;" +
+      "background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);";
+    b.onpointerdown = (e) => e.stopPropagation();
+    b.onclick = (e) => { e.stopPropagation(); run(); };
+    return b;
+  };
+  const segFilterTerms = () =>
+    segFilter.value.toLowerCase().split(/[,|]/).map((t) => t.trim()).filter(Boolean);
+  const segMatches = (name: string, terms: string[]) =>
+    !terms.length || terms.some((t) => name.toLowerCase().includes(t));
+  const setSegOpacities = (entries: [number, number][]) => {
+    const S = opts.segments;
+    if (!S || !entries.length || (S.enabled && !S.enabled())) return;
+    if (S.setMany) S.setMany(entries); else for (const [n, o] of entries) S.set(n, o);
+    opts.onChange?.();
+    paintSegments();
+  };
+  // "Only matches": the matches at full opacity (or what they already had, if visible), the rest off.
+  const showOnly = actionBtn("Show only", "Show only the matching segments; hide the rest", () => {
+    const S = opts.segments!; const terms = segFilterTerms();
+    setSegOpacities(segRows.map((r) => [r.num, segMatches(r.name, terms) ? (S.get(r.num) > 0 ? S.get(r.num) : 1) : 0]));
+  });
+  const hideThese = actionBtn("Hide", "Hide the matching segments", () => {
+    const terms = segFilterTerms();
+    setSegOpacities(segRows.filter((r) => segMatches(r.name, terms)).map((r) => [r.num, 0]));
+  });
+  const showAll = actionBtn("Show all", "Show every segment at full opacity", () => {
+    setSegOpacities(segRows.map((r) => [r.num, 1]));
+  });
+  segActions.append(showOnly, hideThese, showAll);
+  segFilterInfo.append(segCount, segActions);
+  segFilterBar.append(segFilter, segFilterInfo);
+  segHost.appendChild(segFilterBar);
+  const segListHost = document.createElement("div");
+  segHost.appendChild(segListHost);
+  function applySegFilter() {
+    const terms = segFilterTerms();
+    let shown = 0;
+    for (const r of segRows) {
+      const m = segMatches(r.name, terms);
+      r.row.style.display = m ? "flex" : "none";   // not .hidden — the row's inline display:flex would win
+      if (m) shown++;
+    }
+    segCount.textContent = terms.length ? `${shown} of ${segRows.length}` : `${segRows.length} segments`;
+    showOnly.hidden = hideThese.hidden = !terms.length || !shown;
+  }
+  segFilter.oninput = applySegFilter;
+  // Keys typed here are text, not viewer shortcuts; Escape clears the box first, then leaves it.
+  segFilter.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === "Escape") {
+      e.preventDefault();
+      if (segFilter.value) { segFilter.value = ""; applySegFilter(); } else segFilter.blur();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      showOnly.click();
+    }
+  };
+  segFilter.onpointerdown = (e) => e.stopPropagation();
+
   function buildSegments() {
     const S = opts.segments;
-    segRows.length = 0; segHost.innerHTML = "";
+    segRows.length = 0; segListHost.innerHTML = "";
+    segFilterBar.hidden = true;
     if (!S) return;
     const list = S.list();
     const noteText = S.note?.();
@@ -462,9 +554,12 @@ export function installChrome(opts: ChromeOpts): Chrome {
     // segmentation (an irregular series it cannot be registered to) has no rows but owes the
     // viewer the reason.
     if (!list.length && !noteText) return;
+    const filtering = list.length >= SEG_FILTER_MIN;
+    segFilterBar.hidden = !filtering;
+    if (!filtering && segFilter.value) segFilter.value = "";   // a short list shows everything
     const wrap = document.createElement("div");
-    wrap.style.cssText = "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);padding-top:6px;" +
-      (list.length > 6 ? "max-height:210px;overflow-y:auto;" : "");
+    wrap.style.cssText = (filtering ? "margin-top:4px;" : "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);") +
+      "padding-top:6px;" + (filtering ? "max-height:210px;overflow-y:auto;" : "");
     for (const s of list) {
       const row = document.createElement("div");
       row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 2px;";
@@ -481,7 +576,7 @@ export function installChrome(opts: ChromeOpts): Chrome {
       row.appendChild(left); row.appendChild(box);
       const paint = attachOpacity(box, () => S.get(s.num), (o) => { if (!(S.enabled && !S.enabled())) S.set(s.num, o); }, s.color, () => opts.onChange?.());
       wrap.appendChild(row);
-      segRows.push({ num: s.num, name: s.name, box, color: s.color, paint });
+      segRows.push({ num: s.num, name: s.name, box, color: s.color, paint, row });
     }
     if (noteText) {
       const n = document.createElement("div");
@@ -490,7 +585,8 @@ export function installChrome(opts: ChromeOpts): Chrome {
         "color:#ffc454;font:500 11.5px -apple-system,system-ui,sans-serif;line-height:1.35;";
       wrap.appendChild(n);
     }
-    segHost.appendChild(wrap);
+    segListHost.appendChild(wrap);
+    applySegFilter();
     paintSegments();
   }
   function paintSegments() {
@@ -546,15 +642,18 @@ export function installChrome(opts: ChromeOpts): Chrome {
     pop.style.right = Math.round(globalThis.innerWidth - b.right) + "px";
     pop.style.opacity = "1"; pop.style.pointerEvents = "auto"; pop.style.transform = "translateY(0)";
   };
-  const hide = () => { pop.style.opacity = "0"; pop.style.pointerEvents = "none"; pop.style.transform = "translateY(-6px)"; };
+  const hide = () => { if (document.activeElement === segFilter) segFilter.blur(); pop.style.opacity = "0"; pop.style.pointerEvents = "none"; pop.style.transform = "translateY(-6px)"; };
   let pinned = false;
   // The opening state (openOnLoad): ends the first time the pointer leaves the popup, and until then
   // nothing else closes it.
   let startOpen = false;
   logo.onmouseenter = () => { logo.style.transform = "scale(1.08)"; show(); };
   logo.onclick = () => { startOpen = false; pinned = !pinned; pinned ? show() : hide(); };
-  logo.onmouseleave = () => { logo.style.transform = "scale(1)"; if (!pinned && !startOpen) setTimeout(() => { if (!pop.matches(":hover") && !pinned) hide(); }, 120); };
-  pop.onmouseleave = () => { startOpen = false; if (!pinned) hide(); };
+  // Typing in the segment filter holds the popup open: the pointer drifting off it mid-word must
+  // not snatch the box away (a click outside still closes it).
+  const typing = () => document.activeElement === segFilter;
+  logo.onmouseleave = () => { logo.style.transform = "scale(1)"; if (!pinned && !startOpen) setTimeout(() => { if (!pop.matches(":hover") && !pinned && !typing()) hide(); }, 120); };
+  pop.onmouseleave = () => { startOpen = false; if (!pinned && !typing()) hide(); };
   // A click ANYWHERE outside the badge/popup dismisses it (and unpins). Capture phase + contains()
   // so a control click inside the popup never counts as "outside".
   const onDocDown = (e: Event) => {
