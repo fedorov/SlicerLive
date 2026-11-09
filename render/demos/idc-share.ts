@@ -83,7 +83,11 @@ export function shareStudy(src: ShareSource): void {
           ? "Reopens this study here with the same public DICOMweb segmentation store — no sign-in needed."
           : "Reopens this study here with the same segmentation store — whoever opens it signs in with their own Google account."
         : "Reopens this study in the SlicerLive BIR reader (OHIF-style + direct-S3 params).")}
-      ${portal ? row("Open in IDC OHIF portal", portal, "The canonical IDC viewer link for the same study.") : ""}
+      ${portal ? row("Open in IDC OHIF portal", portal, src.gcp
+        ? `The canonical IDC viewer link for the same study. <span style="color:#e0b45a;">It shows only
+          the series in IDC — segmentations from the ${src.storeParam === "dicomweb" ? "DICOMweb" : "Google Cloud"}
+          store will not appear there.</span>`
+        : "The canonical IDC viewer link for the same study.") : ""}
       <div style="text-align:right;margin-top:6px;">
         <button id="idc-share-close" style="font:600 12px -apple-system,system-ui,sans-serif;color:#9fb3d0;
           background:none;border:none;cursor:pointer;padding:6px 4px;">Close</button>
